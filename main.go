@@ -30,6 +30,8 @@ import (
 	"time"
 )
 
+const metricsPath = "/metrics"
+
 var (
 	AMClient      *client.AlertmanagerAPI
 	ActiveSilence models.GettableSilences
@@ -69,7 +71,6 @@ type Scanner struct {
 func main() {
 	var (
 		webConfig       = kingpinflag.AddFlags(kingpin.CommandLine, ":9100")
-		metricsPath     = kingpin.Flag("web.telemetry-path", "Path under which to expose metrics.").Default("/metrics").String()
 		alertmanagerURL = kingpin.Flag("alertmanager-url", "Alertmanager url, seperated with comma").Required().URLList()
 		refreshInterval = kingpin.Flag("refresh-interval",
 			"refresh interval of alertmanager silence").Default("10s").String()
@@ -125,7 +126,24 @@ func main() {
 			}
 		}
 	}()
-	http.Handle(*metricsPath, promhttp.Handler())
+	landingConfig := web.LandingConfig{
+		Name:        "silence scanner",
+		Description: "a tiny daemon scans silence",
+		Version:     version.Info(),
+		Links: []web.LandingLinks{
+			{
+				Address: metricsPath,
+				Text:    "Metrics",
+			},
+		},
+	}
+	landingPage, err := web.NewLandingPage(landingConfig)
+	if err != nil {
+		_ = level.Error(logger).Log("err", err)
+		os.Exit(1)
+	}
+	http.Handle("/", landingPage)
+	http.Handle(metricsPath, promhttp.Handler())
 	server := &http.Server{}
 	if err := web.ListenAndServe(server, webConfig, logger); err != nil {
 		_ = level.Error(logger).Log("err", err)
