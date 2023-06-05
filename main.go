@@ -13,6 +13,8 @@ import (
 	"github.com/prometheus/alertmanager/api/v2/client"
 	"github.com/prometheus/alertmanager/api/v2/models"
 	"github.com/prometheus/alertmanager/cli"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
@@ -33,6 +35,22 @@ var (
 	ActiveSilence models.GettableSilences
 	globalLogger  log.Logger
 	lock          = new(sync.Mutex)
+	scanExecuted  = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "silence_scanner_executed_total",
+		Help: "Number of scanner executed",
+	})
+	scanTimeTaken = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "silence_scanner_time_taken_seconds",
+		Help: "Total seconds taken by silence scanner",
+	})
+	scanDuration = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "silence_scanner_interval",
+		Help: "Time interval of silence scanner",
+	})
+	lastScanChanged = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "silence_scanner_last_change",
+		Help: "Timestamp of last scan change",
+	})
 )
 
 type Scanner struct {
@@ -79,6 +97,7 @@ func main() {
 		_ = level.Error(logger).Log("message", "failed to parse duration", "detail", err)
 		os.Exit(1)
 	}
+	scanDuration.Set(duration.Abs().Seconds())
 	silenceScanner := Scanner{
 		alertmanagerURL: *alertmanagerURL,
 		webhookUrl:      **webhookUrl,
@@ -100,7 +119,9 @@ func main() {
 			case <-done:
 				return
 			case _ = <-ticker.C:
+				now := time.Now()
 				silenceScanner.run()
+				scanTimeTaken.Add(time.Now().Sub(now).Seconds())
 			}
 		}
 	}()
@@ -134,6 +155,7 @@ func getAMClient(servers *[]*url.URL, logger log.Logger) (*client.AlertmanagerAP
 func (s *Scanner) run() {
 	lock.Lock()
 	defer lock.Unlock()
+	scanExecuted.Inc()
 	c, err := getAMClient(&s.alertmanagerURL, s.logger)
 	if err != nil {
 		_ = level.Error(s.logger).Log("msg", "failed to get alertmanager client, all servers cannot be reachable",
@@ -168,6 +190,7 @@ func (s *Scanner) run() {
 		_ = level.Info(s.logger).Log("msg", "no new silences found in this round")
 		return
 	}
+	lastScanChanged.SetToCurrentTime()
 	_ = level.Info(s.logger).Log("msg", "found new silences")
 	for _, silence := range newSilences {
 		j, _ := silence.MarshalJSON()
