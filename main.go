@@ -16,12 +16,14 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/promlog"
 	"github.com/prometheus/common/promlog/flag"
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web"
 	"github.com/prometheus/exporter-toolkit/web/kingpinflag"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"os"
@@ -52,6 +54,10 @@ var (
 	lastScanChanged = promauto.NewGauge(prometheus.GaugeOpts{
 		Name: "silence_scanner_last_change",
 		Help: "Timestamp of last scan change",
+	})
+	lastPersistenceTime = promauto.NewGauge(prometheus.GaugeOpts{
+		Name: "silence_scanner_last_persist",
+		Help: "Timestamp of last silence persistence",
 	})
 )
 
@@ -170,6 +176,20 @@ func getAMClient(servers *[]*url.URL, logger log.Logger) (*client.AlertmanagerAP
 	return nil, errors.New("no valid alertmanager found")
 }
 
+func shouldPersist() bool {
+	var m dto.Metric
+	err := lastPersistenceTime.Write(&m)
+	if err != nil {
+		_ = level.Error(globalLogger).Log("msg", "failed to get last persist time")
+		os.Exit(1)
+	}
+	maxNoPersistTime, _ := time.ParseDuration("20m")
+	if time.Since(time.Unix(int64(math.Round(m.GetGauge().GetValue())), 0)) > maxNoPersistTime {
+		return true
+	}
+	return false
+}
+
 func (s *Scanner) run() {
 	lock.Lock()
 	defer lock.Unlock()
@@ -198,14 +218,13 @@ func (s *Scanner) run() {
 		j, _ := silence.MarshalJSON()
 		_ = level.Debug(s.logger).Log("silence", j)
 	}
-	s3Client, err := getS3Client(s.s3SecretID, s.s3SecretKey, s.s3Endpoint, s.s3Secure)
-	if err != nil {
-		_ = level.Error(s.logger).Log("msg", "failed to get s3 client", "error", err)
-	}
-	oldSilence := s.getOldSilence(s3Client)
+	oldSilence := s.getOldSilence()
 	newSilences := getNewSilence(&oldSilence, &currentSilences)
 	if newSilences == nil {
 		_ = level.Info(s.logger).Log("msg", "no new silences found in this round")
+		if shouldPersist() {
+			s.storeSilences(&currentSilences)
+		}
 		return
 	}
 	lastScanChanged.SetToCurrentTime()
@@ -230,12 +249,19 @@ func (s *Scanner) run() {
 		_ = level.Error(s.logger).Log("msg", "webhook return code not ok")
 		return
 	}
-	s.storeSilences(s3Client, &currentSilences)
+	s.storeSilences(&currentSilences)
 }
 
-func (s *Scanner) getOldSilence(s3Client *minio.Client) models.GettableSilences {
-	if !s.persistence {
+func (s *Scanner) getOldSilence() models.GettableSilences {
+	if ActiveSilence != nil {
 		return ActiveSilence
+	}
+	if !s.persistence {
+		return nil
+	}
+	s3Client, err := getS3Client(s.s3SecretID, s.s3SecretKey, s.s3Endpoint, s.s3Secure)
+	if err != nil {
+		_ = level.Error(s.logger).Log("msg", "failed to get s3 client", "error", err)
 	}
 	reader, err := s3Client.GetObject(context.Background(), s.s3Bucket, s.s3SilencePath, minio.GetObjectOptions{})
 	if err != nil {
@@ -248,7 +274,7 @@ func (s *Scanner) getOldSilence(s3Client *minio.Client) models.GettableSilences 
 		_ = level.Error(globalLogger).Log("msg", "failed to read data from s3", "error", err)
 		return nil
 	}
-	level.Debug(s.logger).Log("msg", "got data from s3", "silences", string(data))
+	_ = level.Debug(s.logger).Log("msg", "got data from s3", "silences", string(data))
 	var silences models.GettableSilences
 	err = json.Unmarshal(data, &silences)
 	if err != nil {
@@ -258,9 +284,14 @@ func (s *Scanner) getOldSilence(s3Client *minio.Client) models.GettableSilences 
 	return silences
 }
 
-func (s *Scanner) storeSilences(s3Client *minio.Client, silences *models.GettableSilences) {
+func (s *Scanner) storeSilences(silences *models.GettableSilences) {
+	ActiveSilence = *silences
 	if !s.persistence {
-		ActiveSilence = *silences
+		return
+	}
+	s3Client, err := getS3Client(s.s3SecretID, s.s3SecretKey, s.s3Endpoint, s.s3Secure)
+	if err != nil {
+		_ = level.Error(s.logger).Log("msg", "failed to get s3 client", "error", err)
 	}
 	// marshal
 	data, err := json.Marshal(silences)
@@ -269,7 +300,14 @@ func (s *Scanner) storeSilences(s3Client *minio.Client, silences *models.Gettabl
 	}
 	reader := bytes.NewReader(data)
 	dataSize := len(data)
-	_, err = s3Client.PutObject(context.Background(), s.s3Bucket, s.s3SilencePath, reader, int64(dataSize), minio.PutObjectOptions{})
+	for i := 0; i < 3; i++ {
+		_, err = s3Client.PutObject(context.Background(), s.s3Bucket, s.s3SilencePath, reader, int64(dataSize), minio.PutObjectOptions{})
+		if err == nil {
+			lastPersistenceTime.SetToCurrentTime()
+			break
+		}
+	}
+
 }
 
 type ByID models.GettableSilences
